@@ -1,0 +1,25 @@
+[package]
+name = "face_recon"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# default-features = false is required: the opencv crate otherwise tries to
+# generate bindings for all 60+ OpenCV modules it can find via pkg-config,
+# including fragile ones (gapi, surface_matching, etc.) whose headers can
+# crash the bindgen pass on newer Clang/OpenCV combos. We only need these.
+#
+# 0.99+ is required for OpenCV 5.0 support: several modules were renamed
+# (calib3d→calib, features2d→features) and aruco/mcc were removed/merged.
+# 0.98.x still emitted the old 4.x library names, causing linker failures.
+opencv = { version = "0.99", default-features = false, features = [
+    "imgproc",
+    "imgcodecs",
+    "objdetect",
+    "videoio",
+    "highgui",
+    "dnn",
+    "xobjdetect",  # face module bindings reference xobjdetect::CascadeClassifier
+    "features",    # objdetect bindings reference features::Feature2D (OCV5 rename of features2d)
+    "geometry",    # contourArea + boundingRect moved from imgproc to geometry in OCV5
+] }

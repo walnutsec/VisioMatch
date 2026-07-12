@@ -1,0 +1,4 @@
+[env]
+# OpenCV 5.0 ships as opencv5.pc; the opencv crate defaults to looking for
+# opencv4.pc. This tells it the correct pkg-config package name.
+OPENCV_PKGCONFIG_NAME = "opencv5"
