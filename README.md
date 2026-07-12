@@ -1,4 +1,4 @@
-# VisioMatch — real identity matching, not just detection
+# VisioMatch — real identity matching
 
 This replaces Gemini's "BIOMETRIC_TOPOLOGY" demo (which only *detects* faces and
 always prints `STATUS: VERIFIED` regardless of who's in frame) with an actual
@@ -69,7 +69,7 @@ This was hand-written and reviewed against known opencv-rust API patterns
 but not compiled in a live environment (no OpenCV/camera available here) —
 treat the first `cargo build` as the real test.
 
-## What's actually new vs. the original
+## What's actually new vs. the original.
 
 - Real LBPH-based recognition instead of a hardcoded "VERIFIED" string
 - Enrollment workflow with auto-retraining
