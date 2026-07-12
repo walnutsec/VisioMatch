@@ -1,4 +1,4 @@
-# face_recon — real identity matching, not just detection
+# VisioMatch — real identity matching, not just detection
 
 This replaces Gemini's "BIOMETRIC_TOPOLOGY" demo (which only *detects* faces and
 always prints `STATUS: VERIFIED` regardless of who's in frame) with an actual
