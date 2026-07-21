@@ -249,4 +249,4 @@ cargo build --release
 
 This project is licensed under the [MIT License](LICENSE).
 
-Copyright © 2026 walnut
+Copyright © 2026 walnutsec
