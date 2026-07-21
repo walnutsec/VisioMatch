@@ -1,7 +1,14 @@
 [package]
-name = "VisioMatch"
+name = "visiomatch"
 version = "0.1.0"
-edition = "2026"
+edition = "2021"
+rust-version = "1.70"
+authors = ["walnut"]
+description = "Real-time ArcFace-powered face recognition and hand tracking built on OpenCV 5.x"
+license = "MIT"
+repository = "https://github.com/walnutsec/VisioMatch"
+categories = ["computer-vision", "multimedia"]
+keywords = ["face-recognition", "arcface", "opencv", "hand-tracking", "biometrics"]
 
 [dependencies]
 # default-features = false is required: the opencv crate otherwise tries to

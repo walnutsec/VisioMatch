@@ -1,3 +1,9 @@
+//! Face enrollment workflow.
+//!
+//! Captures [`ENROLL_TARGET`] face samples from the live camera, computes an
+//! ArcFace embedding for each, averages them, and stores the result in the
+//! JSON embedding database.
+
 use opencv::{
     core::{AlgorithmHint, Mat, Point, Rect, Scalar, Vector},
     highgui, imgcodecs, imgproc,
@@ -11,14 +17,25 @@ use std::{
 
 use crate::{arcface, camera, detect, Result};
 
+/// Number of face samples to capture before finalizing enrollment.
 const ENROLL_TARGET: usize = 5;
+
+/// Directory where per-identity face crops are stored for reference.
 const DATA_DIR: &str = "data/faces";
 
+/// Run the enrollment flow for the given identity `name`.
+///
+/// Opens the camera, presents a live preview, and automatically captures a
+/// sample every 500 ms when exactly one face is detected.  The user can
+/// press `q` or `Esc` to cancel early.
+///
+/// After collection, the embeddings are averaged, L2-normalized, and merged
+/// into the on-disk database at [`arcface::EMBEDDINGS_PATH`].
 pub fn run(name: &str) -> Result<()> {
     let dir = Path::new(DATA_DIR).join(name);
     fs::create_dir_all(&dir)?;
 
-    let mut net = arcface::load_arcface()?;
+    let mut net = arcface::ArcFaceNet::load()?;
     let mut cascade = detect::load_cascade()?;
     let mut cap = camera::open()?;
     highgui::named_window("ENROLL", highgui::WINDOW_NORMAL)?;
@@ -26,26 +43,26 @@ pub fn run(name: &str) -> Result<()> {
     println!("[*] Enrolling '{name}'. Move your head slightly between captures.");
     println!("[*] Need {ENROLL_TARGET} samples. Press 'q' to cancel.");
     let mut last_capture = Instant::now() - Duration::from_secs(1);
-    let mut embeddings: Vec<Vec<f32>> = Vec::new();
+    let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(ENROLL_TARGET);
     let mut sample_idx = 0usize;
 
+    // Reusable Mats — OpenCV skips internal realloc when size/type match.
+    let mut frame = Mat::default();
+    let mut gray = Mat::default();
+    let mut display = Mat::default();
+
     while sample_idx < ENROLL_TARGET {
-        let mut frame = Mat::default();
         cap.read(&mut frame)?;
         if frame.empty() {
             continue;
         }
 
-        // Detection runs on grayscale (equalized)
-        let mut gray = Mat::default();
+        // Detection runs on equalized grayscale.
         imgproc::cvt_color(&frame, &mut gray, imgproc::COLOR_BGR2GRAY, 0, AlgorithmHint::ALGO_HINT_DEFAULT)?;
-        let mut eq = Mat::default();
-        imgproc::equalize_hist(&gray, &mut eq)?;
-        gray = eq;
+        imgproc::equalize_hist(&gray.clone(), &mut gray)?;
 
         let faces: Vector<Rect> = detect::detect_faces_scaled(&mut cascade, &gray)?;
 
-        let mut display = Mat::default();
         frame.copy_to(&mut display)?;
 
         if faces.len() == 1 {
@@ -61,14 +78,15 @@ pub fn run(name: &str) -> Result<()> {
                 )?;
 
                 if last_capture.elapsed() >= Duration::from_millis(500) {
-                    // Save the face crop for reference
+                    // Save the face crop for visual reference.
                     let roi = Mat::roi(&frame, clamped)?;
                     let path = dir.join(format!("{sample_idx:03}.png"));
-                    imgcodecs::imwrite(path.to_str().unwrap(), &roi, &Vector::<i32>::new())?;
+                    let path_str = path.to_string_lossy();
+                    imgcodecs::imwrite(&path_str, &roi, &Vector::<i32>::new())?;
 
-                    // Extract ArcFace embedding from the BGR frame
+                    // Extract ArcFace embedding from the BGR frame.
                     let blob = arcface::preprocess(&frame, clamped)?;
-                    let embedding = arcface::forward(&mut net, &blob)?;
+                    let embedding = net.forward(&blob)?;
                     embeddings.push(embedding);
 
                     sample_idx += 1;

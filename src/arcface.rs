@@ -1,3 +1,9 @@
+//! ArcFace (MobileFaceNet) inference, embedding math, and JSON persistence.
+//!
+//! This module wraps the `w600k_mbf.onnx` ArcFace model behind a thin
+//! [`ArcFaceNet`] struct that caches the DNN output-layer names so they are
+//! resolved once at load time rather than on every forward pass.
+
 use opencv::{
     core::{self, Mat, Rect, Scalar, Size, Vector},
     dnn, imgproc,
@@ -12,42 +18,108 @@ use std::{
 
 use crate::Result;
 
-// ── ArcFace constants ──────────────────────────────────────────────────
+// ── Constants ──────────────────────────────────────────────────────────
+
+/// Filesystem path to the ArcFace ONNX model (relative to project root).
 pub const ARCFACE_MODEL: &str = "data/models/w600k_mbf.onnx";
+
+/// The ArcFace model expects a 112×112 RGB face crop.
 const ARCFACE_INPUT_SIZE: i32 = 112;
+
+/// Dimensionality of the ArcFace embedding vector.
 pub const EMBEDDING_DIM: usize = 512;
-/// Cosine similarity threshold: faces above this value are considered a match.
-/// ArcFace cosine similarities for same-person pairs typically land in 0.4–0.8;
-/// cross-person pairs are usually below 0.3. Start with 0.4 and tune.
+
+/// Cosine-similarity threshold for declaring a match.
+///
+/// ArcFace same-person pairs typically land in **0.4–0.8**; cross-person
+/// pairs are usually **below 0.3**.  Raise for stricter matching, lower to
+/// reduce false rejections.
 pub const COSINE_THRESHOLD: f64 = 0.4;
+
+/// Filesystem path to the JSON embedding database (relative to project root).
 pub const EMBEDDINGS_PATH: &str = "data/embeddings.json";
 
-// ── Model loading ──────────────────────────────────────────────────────
+// ── ArcFaceNet wrapper ─────────────────────────────────────────────────
 
-pub fn load_arcface() -> Result<dnn::Net> {
-    if !Path::new(ARCFACE_MODEL).exists() {
-        return Err(format!(
-            "ArcFace model not found at: {ARCFACE_MODEL}\n\
-             Download it:\n\
-               wget -O data/models/w600k_mbf.onnx \\\n\
-                 https://huggingface.co/deepghs/insightface/resolve/main/buffalo_s/w600k_mbf.onnx"
-        ).into());
+/// Wraps an OpenCV `dnn::Net` loaded with the ArcFace ONNX model and caches
+/// the unconnected-output-layer names so they are resolved once at load time
+/// rather than on every [`ArcFaceNet::forward`] call.
+pub struct ArcFaceNet {
+    net: dnn::Net,
+    out_names: Vector<String>,
+}
+
+impl ArcFaceNet {
+    /// Load the ArcFace ONNX model from [`ARCFACE_MODEL`] and configure the
+    /// OpenCV DNN backend.
+    ///
+    /// Uses `DNN_BACKEND_OPENCV` + `DNN_TARGET_OPENCL` to offload inference to
+    /// the GPU via OpenCL when available (falls back to CPU transparently).
+    pub fn load() -> Result<Self> {
+        if !Path::new(ARCFACE_MODEL).exists() {
+            return Err(format!(
+                "ArcFace model not found at: {ARCFACE_MODEL}\n\
+                 Download it:\n\
+                   wget -O data/models/w600k_mbf.onnx \\\n\
+                     https://huggingface.co/deepghs/insightface/resolve/main/buffalo_s/w600k_mbf.onnx"
+            ).into());
+        }
+        let mut net = dnn::read_net_from_onnx_def(ARCFACE_MODEL)?;
+        net.set_preferable_backend(dnn::DNN_BACKEND_OPENCV)?;
+        net.set_preferable_target(dnn::DNN_TARGET_OPENCL)?;
+
+        // Cache once — this queries the DNN graph topology which is static.
+        let out_names = net.get_unconnected_out_layers_names()?;
+
+        println!("[*] ArcFace model loaded: {ARCFACE_MODEL}");
+        Ok(Self { net, out_names })
     }
-    let mut net = dnn::read_net_from_onnx_def(ARCFACE_MODEL)?;
-    // Use OpenCL on the Intel UHD iGPU when available; falls back to CPU.
-    net.set_preferable_backend(dnn::DNN_BACKEND_OPENCV)?;
-    net.set_preferable_target(dnn::DNN_TARGET_OPENCL)?;
-    println!("[*] ArcFace model loaded: {ARCFACE_MODEL}");
-    Ok(net)
+
+    /// Run ArcFace inference on a preprocessed blob and return an
+    /// L2-normalized 512-d embedding vector.
+    ///
+    /// # Safety contract
+    /// The output Mat is accessed via a bounds-checked raw pointer read.
+    /// OpenCV guarantees 4-byte alignment for CV_32F Mats from its default
+    /// allocator, and we verify the element count before reading.
+    pub fn forward(&mut self, blob: &Mat) -> Result<Vec<f32>> {
+        self.net.set_input(blob, "", 1.0, Scalar::default())?;
+        let mut outputs: Vector<Mat> = Vector::new();
+        self.net.forward(&mut outputs, &self.out_names)?;
+
+        if outputs.is_empty() {
+            return Err("ArcFace produced no output".into());
+        }
+        let out = outputs.get(0)?;
+
+        // Validate shape: expect [1, 512] = 512 elements of CV_32F.
+        if out.total() < EMBEDDING_DIM {
+            return Err(format!(
+                "ArcFace output too small: {} elements (expected {EMBEDDING_DIM})",
+                out.total()
+            ).into());
+        }
+        debug_assert!(
+            out.is_continuous(),
+            "ArcFace output Mat is not continuous — cannot safely read raw data"
+        );
+
+        // SAFETY: `out` is a continuous CV_32F Mat with at least EMBEDDING_DIM
+        // elements.  OpenCV's default allocator guarantees 4-byte alignment for
+        // f32 data.  The Mat outlives this slice access.
+        let ptr = out.data() as *const f32;
+        let raw: &[f32] = unsafe { std::slice::from_raw_parts(ptr, EMBEDDING_DIM) };
+
+        // L2-normalize the raw embedding.
+        let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-10);
+        Ok(raw.iter().map(|x| x / norm).collect())
+    }
 }
 
 // ── Preprocessing ──────────────────────────────────────────────────────
 
-/// Preprocess a BGR face crop for ArcFace:
-///   1. Crop the detection rect from the full-color frame
-///   2. Resize to 112×112
-///   3. Normalize: (pixel - 127.5) / 128.0
-///   4. Create NCHW blob [1, 3, 112, 112]
+/// Crop `rect` from `bgr_frame`, resize to 112×112, and convert to an
+/// NCHW blob normalized with `(pixel - 127.5) / 128.0`.
 pub fn preprocess(bgr_frame: &Mat, rect: Rect) -> Result<Mat> {
     let roi = Mat::roi(bgr_frame, rect)?;
     let mut resized = Mat::default();
@@ -67,43 +139,29 @@ pub fn preprocess(bgr_frame: &Mat, rect: Rect) -> Result<Mat> {
     Ok(normalized)
 }
 
-// ── Inference ──────────────────────────────────────────────────────────
-
-/// Run ArcFace inference on a preprocessed blob, return L2-normalized 512-d embedding.
-pub fn forward(net: &mut dnn::Net, blob: &Mat) -> Result<Vec<f32>> {
-    net.set_input(blob, "", 1.0, Scalar::default())?;
-    let out_names = net.get_unconnected_out_layers_names()?;
-    let mut outputs: Vector<Mat> = Vector::new();
-    net.forward(&mut outputs, &out_names)?;
-    if outputs.is_empty() {
-        return Err("ArcFace produced no output".into());
-    }
-    let out = outputs.get(0)?;
-    // out shape: [1, 512]
-    if (out.total() as usize) < EMBEDDING_DIM {
-        return Err(format!("ArcFace output too small: {} (expected {})", out.total(), EMBEDDING_DIM).into());
-    }
-    let ptr = out.data() as *const f32;
-    let raw: Vec<f32> = unsafe { std::slice::from_raw_parts(ptr, EMBEDDING_DIM) }.to_vec();
-    // L2-normalize
-    let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-10);
-    Ok(raw.iter().map(|x| x / norm).collect())
-}
-
 // ── Similarity & averaging ─────────────────────────────────────────────
 
+/// Compute cosine similarity between two L2-normalized embedding vectors.
+///
+/// Because both vectors are already unit-length, this is simply the dot
+/// product.  The computation is done in `f64` to avoid accumulated rounding.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
-    // Both vectors are already L2-normalized, so dot product = cosine.
     a.iter().zip(b.iter()).map(|(x, y)| (*x as f64) * (*y as f64)).sum()
 }
 
-/// Average multiple embeddings element-wise, then L2-normalize.
+/// Average multiple embeddings element-wise, then L2-normalize the result.
+///
+/// Returns an empty vector if `embeddings` is empty (no panic).
 pub fn average_embeddings(embeddings: &[Vec<f32>]) -> Vec<f32> {
+    if embeddings.is_empty() {
+        return vec![0.0f32; EMBEDDING_DIM];
+    }
+
     let n = embeddings.len() as f32;
     let mut avg = vec![0.0f32; EMBEDDING_DIM];
     for emb in embeddings {
-        for (i, v) in emb.iter().enumerate() {
-            avg[i] += v;
+        for (a, v) in avg.iter_mut().zip(emb.iter()) {
+            *a += v;
         }
     }
     for v in avg.iter_mut() {
@@ -115,18 +173,25 @@ pub fn average_embeddings(embeddings: &[Vec<f32>]) -> Vec<f32> {
 
 // ── Embedding database (JSON persistence) ──────────────────────────────
 
-/// Stores name → averaged 512-d embedding vector.
+/// Maps identity name → averaged 512-d embedding vector.
 pub type EmbeddingDb = HashMap<String, Vec<f32>>;
 
+/// Load the embedding database from [`EMBEDDINGS_PATH`].
+///
+/// Returns an empty database if the file does not exist.
 pub fn load_embeddings() -> Result<EmbeddingDb> {
     if !Path::new(EMBEDDINGS_PATH).exists() {
         return Ok(HashMap::new());
     }
     let data = fs::read_to_string(EMBEDDINGS_PATH)?;
-    let db: EmbeddingDb = parse_json(&data)?;
-    Ok(db)
+    parse_json(&data)
 }
 
+/// Persist the embedding database to [`EMBEDDINGS_PATH`] as JSON.
+///
+/// Creates parent directories if they do not exist.  Identity names are
+/// properly escaped so special characters (quotes, backslashes) do not
+/// corrupt the file.
 pub fn save_embeddings(db: &EmbeddingDb) -> Result<()> {
     fs::create_dir_all(Path::new(EMBEDDINGS_PATH).parent().unwrap())?;
     let mut f = fs::File::create(EMBEDDINGS_PATH)?;
@@ -135,45 +200,190 @@ pub fn save_embeddings(db: &EmbeddingDb) -> Result<()> {
     for (name, emb) in db {
         if !first { write!(f, ",")?; }
         first = false;
-        write!(f, "\"{}\":[{}]", name,
+        // Escape special JSON characters in the identity name.
+        let escaped = escape_json_string(name);
+        write!(f, "\"{escaped}\":[{}]",
             emb.iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(","))?;
     }
     writeln!(f, "}}")?;
     Ok(())
 }
 
-/// Minimal JSON parser for our simple {"name": [f32, ...], ...} format.
-/// We avoid pulling in serde_json as a dependency for this one use case.
+/// Escape characters that are special in JSON strings: `"`, `\`, and
+/// control characters.
+fn escape_json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"'  => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                // \uXXXX escape for other control characters.
+                for unit in c.encode_utf16(&mut [0; 2]) {
+                    out.push_str(&format!("\\u{unit:04x}"));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Unescape a JSON string value (handles `\"`, `\\`, `\n`, `\r`, `\t`).
+fn unescape_json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('"')  => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('n')  => out.push('\n'),
+                Some('r')  => out.push('\r'),
+                Some('t')  => out.push('\t'),
+                Some('u')  => {
+                    // \uXXXX — parse 4 hex digits.
+                    let hex: String = chars.by_ref().take(4).collect();
+                    if let Ok(code) = u16::from_str_radix(&hex, 16) {
+                        if let Some(c) = char::from_u32(code as u32) {
+                            out.push(c);
+                        }
+                    }
+                }
+                Some(other) => { out.push('\\'); out.push(other); }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Minimal JSON parser for the `{"name": [f32, ...], ...}` format used by
+/// the embedding database.
+///
+/// This avoids a `serde_json` dependency for a single, well-defined schema.
+/// The parser correctly handles:
+/// - escaped characters in key names
+/// - the trailing `]` on the last entry (no trailing comma)
+/// - whitespace between tokens
 fn parse_json(json: &str) -> Result<EmbeddingDb> {
     let mut db = EmbeddingDb::new();
     let json = json.trim();
     if json.is_empty() || json == "{}" {
         return Ok(db);
     }
-    // Strip outer braces
-    let inner = json.strip_prefix('{').and_then(|s| s.strip_suffix('}'))
-        .ok_or("Invalid embedding JSON: missing braces")?;
-    // Split on "]," to get key-value pairs, but the last one won't have trailing comma
-    for entry in inner.split("],") {
-        let entry = entry.trim().trim_end_matches('}');
-        if entry.is_empty() { continue; }
-        let (key_part, vals_part) = entry.split_once(":[")
-            .ok_or_else(|| format!("Invalid embedding entry: {}", &entry[..entry.len().min(60)]))?;
-        let name = key_part.trim().trim_matches('"').to_string();
-        let vals_str = vals_part.trim_end_matches(']');
-        let vals: std::result::Result<Vec<f32>, _> = vals_str.split(',')
+
+    // Strip outer braces.
+    let inner = json.strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .ok_or("Invalid embedding JSON: missing outer braces")?
+        .trim();
+
+    if inner.is_empty() {
+        return Ok(db);
+    }
+
+    // State-machine approach: find each key-value pair by tracking bracket
+    // depth so we correctly handle `]` inside values without mis-splitting.
+    let bytes = inner.as_bytes();
+    let len = bytes.len();
+    let mut pos = 0;
+
+    while pos < len {
+        // Skip whitespace and commas between entries.
+        while pos < len && (bytes[pos] == b',' || bytes[pos].is_ascii_whitespace()) {
+            pos += 1;
+        }
+        if pos >= len { break; }
+
+        // Expect opening quote for key.
+        if bytes[pos] != b'"' {
+            return Err(format!(
+                "Invalid embedding JSON at position {pos}: expected '\"', found '{}'",
+                bytes[pos] as char
+            ).into());
+        }
+        pos += 1; // skip opening "
+
+        // Read key (handle escape sequences).
+        let key_start = pos;
+        let mut key = String::new();
+        let mut found_end_quote = false;
+        while pos < len {
+            if bytes[pos] == b'\\' && pos + 1 < len {
+                pos += 2; // skip escaped character
+                continue;
+            }
+            if bytes[pos] == b'"' {
+                key = unescape_json_string(&inner[key_start..pos]);
+                pos += 1; // skip closing "
+                found_end_quote = true;
+                break;
+            }
+            pos += 1;
+        }
+        if !found_end_quote {
+            return Err("Invalid embedding JSON: unterminated key string".into());
+        }
+
+        // Skip whitespace + colon.
+        while pos < len && bytes[pos].is_ascii_whitespace() { pos += 1; }
+        if pos >= len || bytes[pos] != b':' {
+            return Err(format!("Invalid embedding JSON: expected ':' after key \"{key}\"").into());
+        }
+        pos += 1; // skip :
+
+        // Skip whitespace + opening bracket.
+        while pos < len && bytes[pos].is_ascii_whitespace() { pos += 1; }
+        if pos >= len || bytes[pos] != b'[' {
+            return Err(format!("Invalid embedding JSON: expected '[' for value of \"{key}\"").into());
+        }
+        pos += 1; // skip [
+
+        // Read until matching ']'.
+        let val_start = pos;
+        let mut depth = 1;
+        while pos < len && depth > 0 {
+            match bytes[pos] {
+                b'[' => depth += 1,
+                b']' => depth -= 1,
+                _ => {}
+            }
+            pos += 1;
+        }
+        if depth != 0 {
+            return Err(format!("Invalid embedding JSON: unterminated array for \"{key}\"").into());
+        }
+
+        // Parse the comma-separated f32 values (pos is now past the ']').
+        let vals_str = &inner[val_start..pos - 1]; // exclude the closing ']'
+        let vals: std::result::Result<Vec<f32>, _> = vals_str
+            .split(',')
             .map(|s| s.trim().parse::<f32>())
             .collect();
-        let vals = vals.map_err(|e| format!("Failed to parse embedding for '{name}': {e}"))?;
+        let vals = vals.map_err(|e| format!("Failed to parse embedding for \"{key}\": {e}"))?;
+
         if vals.len() != EMBEDDING_DIM {
-            return Err(format!("Embedding for '{name}' has {} values (expected {EMBEDDING_DIM})", vals.len()).into());
+            return Err(format!(
+                "Embedding for \"{key}\" has {} values (expected {EMBEDDING_DIM})",
+                vals.len()
+            ).into());
         }
-        db.insert(name, vals);
+
+        db.insert(key, vals);
     }
+
     Ok(db)
 }
 
 /// Find the closest identity in the database by cosine similarity.
+///
+/// Returns `("UNKNOWN", -1.0)` if the database is empty.
 pub fn find_best_match(db: &EmbeddingDb, query: &[f32]) -> (String, f64) {
     let mut best_name = "UNKNOWN".to_string();
     let mut best_sim = -1.0f64;

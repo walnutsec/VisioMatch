@@ -1,5 +1,11 @@
+//! Haar cascade face detection with half-resolution scaling.
+//!
+//! Runs the OpenCV Haar cascade at [`DETECT_SCALE`] (50%) of the input
+//! resolution to reduce detection latency, then maps bounding boxes back to
+//! full-frame coordinates.
+
 use opencv::{
-    core::{Mat, Point, Rect, Size, Vector},
+    core::{Mat, Rect, Size, Vector},
     imgproc,
     prelude::*,
     xobjdetect,
@@ -8,16 +14,30 @@ use std::path::Path;
 
 use crate::Result;
 
+/// Search paths for the Haar frontal-face cascade, in priority order.
+/// OpenCV 5.x installs to `opencv5/`, while 4.x uses `opencv4/`.
 const CASCADE_PATHS: &[&str] = &[
     "/usr/share/opencv5/haarcascades/haarcascade_frontalface_default.xml",
     "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
 ];
-/// Haar detection runs on a downscaled image for speed. This is the
-/// single biggest FPS win: same effective minimum face size, 75% fewer
-/// pixels for the cascade to scan.
-const DETECT_SCALE: f64 = 0.5;
-const CASCADE_MIN_FACE: i32 = 80; // minimum face size in full-frame pixels
 
+/// Detection runs at this fraction of the input resolution.
+///
+/// 0.5 halves each dimension (4× fewer pixels for the cascade to scan),
+/// which roughly doubles detection throughput at the cost of missing very
+/// small faces (below ~40px at the original resolution).
+const DETECT_SCALE: f64 = 0.5;
+
+/// Minimum face size **at the original resolution** (pixels).
+///
+/// Faces smaller than this are ignored.  The value is scaled down by
+/// [`DETECT_SCALE`] before being passed to the cascade.
+const CASCADE_MIN_FACE: i32 = 80;
+
+/// Locate the Haar cascade XML file on the filesystem.
+///
+/// Returns the first path from [`CASCADE_PATHS`] that exists, or an error
+/// listing all searched locations.
 pub fn find_cascade() -> Result<&'static str> {
     for path in CASCADE_PATHS {
         if Path::new(path).exists() {
@@ -30,12 +50,17 @@ pub fn find_cascade() -> Result<&'static str> {
     ).into())
 }
 
+/// Load and return a [`CascadeClassifier`] from the auto-detected cascade path.
 pub fn load_cascade() -> Result<xobjdetect::CascadeClassifier> {
     let path = find_cascade()?;
     println!("[*] Using cascade: {path}");
     Ok(xobjdetect::CascadeClassifier::new(path)?)
 }
 
+/// Clamp a rectangle to fit within `[0, max_w) × [0, max_h)`.
+///
+/// Returns `None` if the clamped rectangle has zero or negative area
+/// (i.e., it was entirely outside the valid region).
 pub fn clamp_rect(r: Rect, max_w: i32, max_h: i32) -> Option<Rect> {
     let x = r.x.max(0);
     let y = r.y.max(0);
@@ -48,8 +73,10 @@ pub fn clamp_rect(r: Rect, max_w: i32, max_h: i32) -> Option<Rect> {
     }
 }
 
-/// Detect faces on a downscaled copy of `gray` (DETECT_SCALE), then map the
-/// resulting rectangles back up to full-frame coordinates.
+/// Detect faces in a grayscale image using the Haar cascade at half resolution.
+///
+/// The returned rectangles are in the coordinate space of the **original**
+/// (full-resolution) image.
 pub fn detect_faces_scaled(
     cascade: &mut xobjdetect::CascadeClassifier,
     gray: &Mat,
@@ -76,6 +103,7 @@ pub fn detect_faces_scaled(
         Size::new(0, 0),
     )?;
 
+    // Map detections back to full-resolution coordinates.
     let scale_back = 1.0 / DETECT_SCALE;
     let mut faces: Vector<Rect> = Vector::new();
     for r in faces_small.iter() {
