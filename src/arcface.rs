@@ -204,6 +204,7 @@ pub fn save_embeddings(db: &EmbeddingDb) -> Result<()> {
     for (name, emb) in db {
         if !first { write!(f, ",")?; }
         first = false;
+        let escaped = escape_json_string(name);
         write!(f, "\"{escaped}\":[")?;
         for (i, v) in emb.iter().enumerate() {
             if i > 0 { write!(f, ",")?; }
