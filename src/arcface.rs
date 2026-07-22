@@ -18,7 +18,7 @@ use std::{
 
 use crate::Result;
 
-// ── Constants ──────────────────────────────────────────────────────────
+// ── Constants
 
 /// Filesystem path to the ArcFace ONNX model (relative to project root).
 pub const ARCFACE_MODEL: &str = "data/models/w600k_mbf.onnx";
@@ -120,23 +120,26 @@ impl ArcFaceNet {
 
 /// Crop `rect` from `bgr_frame`, resize to 112×112, and convert to an
 /// NCHW blob normalized with `(pixel - 127.5) / 128.0`.
-pub fn preprocess(bgr_frame: &Mat, rect: Rect) -> Result<Mat> {
+pub fn preprocess(
+    bgr_frame: &Mat,
+    rect: Rect,
+    resized: &mut Mat,
+    normalized: &mut Mat,
+) -> Result<()> {
     let roi = Mat::roi(bgr_frame, rect)?;
-    let mut resized = Mat::default();
     imgproc::resize(
         &roi,
-        &mut resized,
+        resized,
         Size::new(ARCFACE_INPUT_SIZE, ARCFACE_INPUT_SIZE),
         0.0,
         0.0,
         imgproc::INTER_LINEAR,
     )?;
     // blob_from_image_def creates NCHW [1, 3, 112, 112] from BGR.
-    let blob = dnn::blob_from_image_def(&resized)?;
+    let blob = dnn::blob_from_image_def(resized)?;
     // Normalize: (pixel - 127.5) / 128.0
-    let mut normalized = Mat::default();
-    blob.convert_to(&mut normalized, core::CV_32F, 1.0 / 128.0, -127.5 / 128.0)?;
-    Ok(normalized)
+    blob.convert_to(normalized, core::CV_32F, 1.0 / 128.0, -127.5 / 128.0)?;
+    Ok(())
 }
 
 // ── Similarity & averaging ─────────────────────────────────────────────
@@ -144,9 +147,10 @@ pub fn preprocess(bgr_frame: &Mat, rect: Rect) -> Result<Mat> {
 /// Compute cosine similarity between two L2-normalized embedding vectors.
 ///
 /// Because both vectors are already unit-length, this is simply the dot
-/// product.  The computation is done in `f64` to avoid accumulated rounding.
+/// product.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
-    a.iter().zip(b.iter()).map(|(x, y)| (*x as f64) * (*y as f64)).sum()
+    let sum: f32 = a.iter().zip(b.iter()).map(|(x, y)| *x * *y).sum();
+    sum as f64
 }
 
 /// Average multiple embeddings element-wise, then L2-normalize the result.
@@ -200,16 +204,17 @@ pub fn save_embeddings(db: &EmbeddingDb) -> Result<()> {
     for (name, emb) in db {
         if !first { write!(f, ",")?; }
         first = false;
-        // Escape special JSON characters in the identity name.
-        let escaped = escape_json_string(name);
-        write!(f, "\"{escaped}\":[{}]",
-            emb.iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(","))?;
+        write!(f, "\"{escaped}\":[")?;
+        for (i, v) in emb.iter().enumerate() {
+            if i > 0 { write!(f, ",")?; }
+            write!(f, "{v:.6}")?;
+        }
+        write!(f, "]")?;
     }
     writeln!(f, "}}")?;
     Ok(())
 }
 
-/// Escape characters that are special in JSON strings: `"`, `\`, and
 /// control characters.
 fn escape_json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -221,7 +226,6 @@ fn escape_json_string(s: &str) -> String {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             c if c.is_control() => {
-                // \uXXXX escape for other control characters.
                 for unit in c.encode_utf16(&mut [0; 2]) {
                     out.push_str(&format!("\\u{unit:04x}"));
                 }
@@ -289,13 +293,11 @@ fn parse_json(json: &str) -> Result<EmbeddingDb> {
     }
 
     // State-machine approach: find each key-value pair by tracking bracket
-    // depth so we correctly handle `]` inside values without mis-splitting.
     let bytes = inner.as_bytes();
     let len = bytes.len();
     let mut pos = 0;
 
     while pos < len {
-        // Skip whitespace and commas between entries.
         while pos < len && (bytes[pos] == b',' || bytes[pos].is_ascii_whitespace()) {
             pos += 1;
         }
@@ -321,7 +323,7 @@ fn parse_json(json: &str) -> Result<EmbeddingDb> {
             }
             if bytes[pos] == b'"' {
                 key = unescape_json_string(&inner[key_start..pos]);
-                pos += 1; // skip closing "
+                pos += 1;
                 found_end_quote = true;
                 break;
             }
@@ -343,7 +345,7 @@ fn parse_json(json: &str) -> Result<EmbeddingDb> {
         if pos >= len || bytes[pos] != b'[' {
             return Err(format!("Invalid embedding JSON: expected '[' for value of \"{key}\"").into());
         }
-        pos += 1; // skip [
+        pos += 1;
 
         // Read until matching ']'.
         let val_start = pos;
@@ -360,8 +362,7 @@ fn parse_json(json: &str) -> Result<EmbeddingDb> {
             return Err(format!("Invalid embedding JSON: unterminated array for \"{key}\"").into());
         }
 
-        // Parse the comma-separated f32 values (pos is now past the ']').
-        let vals_str = &inner[val_start..pos - 1]; // exclude the closing ']'
+        let vals_str = &inner[val_start..pos - 1];
         let vals: std::result::Result<Vec<f32>, _> = vals_str
             .split(',')
             .map(|s| s.trim().parse::<f32>())

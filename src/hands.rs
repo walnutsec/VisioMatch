@@ -15,7 +15,7 @@ use std::{
     time::Instant,
 };
 
-use crate::{camera, detect, Result};
+use crate::{camera, Result};
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -149,9 +149,6 @@ pub fn run() -> Result<()> {
         // Dim backdrop for HUD readability.
         flipped.convert_to(&mut display, -1, 0.65, 0.0)?;
 
-        let frame_w = flipped.cols();
-        let frame_h = flipped.rows();
-
         // Find hand candidate bounding boxes from skin-color segmentation.
         let candidates = find_hand_candidates(
             &flipped, &mut small, &mut ycrcb, &mut skin_mask,
@@ -162,13 +159,13 @@ pub fn run() -> Result<()> {
             // Square-pad around the bounding box for a stable crop.
             let side = bbox.width.max(bbox.height);
             let pad  = side / 3;
-            let hand_rect = match detect::clamp_rect(
-                Rect::new(bbox.x - pad, bbox.y - pad, side + 2 * pad, side + 2 * pad),
-                frame_w, frame_h,
-            ) {
-                Some(r) if r.width >= 50 && r.height >= 50 => r,
-                _ => continue,
-            };
+            let target_w = side + 2 * pad;
+            let target_h = side + 2 * pad;
+            let hand_rect = Rect::new(bbox.x - pad, bbox.y - pad, target_w, target_h);
+
+            if target_w < 50 || target_h < 50 {
+                continue;
+            }
 
             // Preprocess and run the landmark model.
             let blob = preprocess_hand_blob(
@@ -289,7 +286,7 @@ fn find_hand_candidates(
             candidates.push((i, area));
         }
     }
-    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     candidates.truncate(2);
 
     // Scale bounding rects back to full-resolution coordinates.
@@ -321,9 +318,44 @@ fn preprocess_hand_blob(
     rgb: &mut Mat,
     float_hwc: &mut Mat,
 ) -> Result<Mat> {
-    let hand_roi = Mat::roi(bgr_frame, hand_rect)?;
+    let frame_w = bgr_frame.cols();
+    let frame_h = bgr_frame.rows();
+
+    let x_min = hand_rect.x.max(0);
+    let y_min = hand_rect.y.max(0);
+    let x_max = (hand_rect.x + hand_rect.width).min(frame_w);
+    let y_max = (hand_rect.y + hand_rect.height).min(frame_h);
+
+    if x_min >= x_max || y_min >= y_max {
+        return Err("Hand completely out of frame".into());
+    }
+
+    let clamped = Rect::new(x_min, y_min, x_max - x_min, y_max - y_min);
+    let roi = Mat::roi(bgr_frame, clamped)?;
+
+    let top = (0 - hand_rect.y).max(0);
+    let bottom = (hand_rect.y + hand_rect.height - frame_h).max(0);
+    let left = (0 - hand_rect.x).max(0);
+    let right = (hand_rect.x + hand_rect.width - frame_w).max(0);
+
+    let padded = if top > 0 || bottom > 0 || left > 0 || right > 0 {
+        let mut p = Mat::default();
+        core::copy_make_border(
+            &roi,
+            &mut p,
+            top, bottom, left, right,
+            core::BORDER_CONSTANT,
+            Scalar::default(),
+        )?;
+        p
+    } else {
+        let mut p = Mat::default();
+        roi.copy_to(&mut p)?;
+        p
+    };
+
     imgproc::resize(
-        &hand_roi, resized,
+        &padded, resized,
         Size::new(MODEL_INPUT_SIZE, MODEL_INPUT_SIZE),
         0.0, 0.0, imgproc::INTER_LINEAR,
     )?;

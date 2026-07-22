@@ -75,30 +75,39 @@ sudo dnf install opencv-devel clang pkg-config
 ```bash
 git clone https://github.com/walnutsec/VisioMatch.git
 cd VisioMatch
+cargo build --release
 ```
 
-### Download the ArcFace Model (Required)
+### Quick Setup (Recommended)
+
+Run the interactive setup wizard — it downloads models, creates directories, and verifies your environment automatically:
 
 ```bash
+cargo run --release -- setup
+```
+
+The wizard will:
+1. Check for `curl` or `wget`
+2. Create required directories (`data/models/`, `data/faces/`)
+3. Download the ArcFace model (~13 MB, required)
+4. Optionally download the hand landmark model (~5 MB)
+5. Verify the Haar cascade and model loading
+
+<details>
+<summary><b>Manual setup (alternative)</b></summary>
+
+```bash
+# Required: ArcFace model
 mkdir -p data/models
 wget -O data/models/w600k_mbf.onnx \
   https://huggingface.co/deepghs/insightface/resolve/main/buffalo_s/w600k_mbf.onnx
-```
 
-### Download the Hand Landmark Model (Optional)
-
-Only needed if you want to use the hand-tracking mode:
-
-```bash
+# Optional: Hand landmark model
 wget -O data/models/handpose_estimation_mediapipe_2023feb.onnx \
   https://github.com/opencv/opencv_zoo/raw/main/models/handpose_estimation_mediapipe/handpose_estimation_mediapipe_2023feb.onnx
 ```
 
-### Build
-
-```bash
-cargo build --release
-```
+</details>
 
 ---
 
@@ -158,7 +167,9 @@ VisioMatch/
 │   ├── detect.rs          # Haar cascade face detection (half-resolution)
 │   ├── enroll.rs          # Enrollment workflow: capture → embed → save
 │   ├── recognize.rs       # Live recognition with track system + HUD
-│   └── hands.rs           # Hand tracking (MediaPipe landmark model)
+│   ├── tracker.rs         # Centroid-based face tracker with EMA smoothing
+│   ├── hands.rs           # Hand tracking (MediaPipe landmark model)
+│   └── setup.rs           # Interactive first-time setup wizard
 ├── Cargo.toml
 ├── LICENSE                # MIT
 └── README.md

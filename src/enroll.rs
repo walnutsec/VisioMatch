@@ -50,6 +50,12 @@ pub fn run(name: &str) -> Result<()> {
     let mut frame = Mat::default();
     let mut gray = Mat::default();
     let mut display = Mat::default();
+    let mut small = Mat::default();
+    let mut equalized = Mat::default();
+
+    // Reusable Mats for ArcFace preprocessing
+    let mut resized_face = Mat::default();
+    let mut normalized_face = Mat::default();
 
     while sample_idx < ENROLL_TARGET {
         cap.read(&mut frame)?;
@@ -59,9 +65,9 @@ pub fn run(name: &str) -> Result<()> {
 
         // Detection runs on equalized grayscale.
         imgproc::cvt_color(&frame, &mut gray, imgproc::COLOR_BGR2GRAY, 0, AlgorithmHint::ALGO_HINT_DEFAULT)?;
-        imgproc::equalize_hist(&gray.clone(), &mut gray)?;
+        imgproc::equalize_hist(&gray, &mut equalized)?;
 
-        let faces: Vector<Rect> = detect::detect_faces_scaled(&mut cascade, &gray)?;
+        let faces: Vector<Rect> = detect::detect_faces_scaled(&mut cascade, &equalized, &mut small)?;
 
         frame.copy_to(&mut display)?;
 
@@ -85,8 +91,8 @@ pub fn run(name: &str) -> Result<()> {
                     imgcodecs::imwrite(&path_str, &roi, &Vector::<i32>::new())?;
 
                     // Extract ArcFace embedding from the BGR frame.
-                    let blob = arcface::preprocess(&frame, clamped)?;
-                    let embedding = net.forward(&blob)?;
+                    arcface::preprocess(&frame, clamped, &mut resized_face, &mut normalized_face)?;
+                    let embedding = net.forward(&normalized_face)?;
                     embeddings.push(embedding);
 
                     sample_idx += 1;

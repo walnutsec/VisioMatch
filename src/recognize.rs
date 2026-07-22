@@ -6,54 +6,23 @@
 //! FPS counter.
 
 use opencv::{
-    core::{AlgorithmHint, Mat, Point, Point2f, Rect, Scalar, Vector},
-    features, highgui, imgproc,
+    core::{AlgorithmHint, Mat, Point, Rect, Scalar, Vector},
+    highgui, imgproc,
     prelude::*,
 };
 use std::time::Instant;
 
-use crate::{arcface, camera, detect, Result};
+use crate::{arcface, camera, detect, tracker::{CentroidTracker, Detection}, Result};
 
 // ── Track state ────────────────────────────────────────────────────────
-
-/// Persistent per-face track used to stabilize the HUD across frames.
-///
-/// Tracks are associated to detections via centroid distance (proportional
-/// to the face's bounding-box size) and are dropped after [`TRACK_MAX_MISSED`]
-/// consecutive frames without a match.
-struct Track {
-    /// Unique monotonic ID shown on the HUD.
-    id: u32,
-    /// Centroid of the last matched bounding box, in full-frame pixels.
-    centroid: (f32, f32),
-    /// Display name of the best-matching enrolled identity.
-    name: String,
-    /// EMA-smoothed cosine similarity for stable HUD readout.
-    confidence: f64,
-    /// Consecutive frames this track has not been associated with a detection.
-    missed: u32,
-}
-
-/// Maximum centroid-distance multiplier relative to face diagonal for
-/// track association.  A value of 0.6 means a detection can be up to 60%
-/// of the face diagonal away and still match the same track.
-const TRACK_DIST_RATIO: f32 = 0.6;
-
-/// Number of consecutive missed frames before a track is dropped.
-const TRACK_MAX_MISSED: u32 = 20;
 
 /// EMA smoothing factor for the FPS counter.  Higher = more responsive
 /// but noisier; lower = smoother but more latent.
 const FPS_EMA_ALPHA: f64 = 0.15;
 
-/// EMA weight for the new observation when smoothing track confidence.
-const CONFIDENCE_EMA_NEW: f64 = 0.4;
-
 // ── HUD colors (BGR) ──────────────────────────────────────────────────
 
 const NEON_CYAN: Scalar = Scalar::new(255.0, 200.0, 0.0, 0.0);
-const MESH_DIM: Scalar = Scalar::new(100.0, 50.0, 0.0, 0.0);
-const NEON_WHITE: Scalar = Scalar::new(240.0, 240.0, 240.0, 0.0);
 const COLOR_MATCH: Scalar = Scalar::new(80.0, 255.0, 120.0, 0.0);
 const COLOR_UNKNOWN: Scalar = Scalar::new(60.0, 60.0, 255.0, 0.0);
 
@@ -101,14 +70,19 @@ pub fn run() -> Result<()> {
     let mut fps = 0.0f64;
     let mut last_frame_time = Instant::now();
 
-    let mut tracks: Vec<Track> = Vec::new();
-    let mut next_track_id: u32 = 1;
+    let mut tracker = CentroidTracker::new();
 
     // Hoisted Mats — reused across frames to avoid per-frame heap churn.
     // OpenCV skips internal realloc when size/type already match.
     let mut frame = Mat::default();
     let mut gray = Mat::default();
     let mut processed = Mat::default();
+    let mut small = Mat::default();
+    let mut equalized = Mat::default();
+
+    // Reusable Mats for ArcFace preprocessing
+    let mut resized_face = Mat::default();
+    let mut normalized_face = Mat::default();
 
     loop {
         cap.read(&mut frame)?;
@@ -127,15 +101,16 @@ pub fn run() -> Result<()> {
 
         // Detection runs on equalized grayscale.
         imgproc::cvt_color(&frame, &mut gray, imgproc::COLOR_BGR2GRAY, 0, AlgorithmHint::ALGO_HINT_DEFAULT)?;
-        imgproc::equalize_hist(&gray.clone(), &mut gray)?;
+        imgproc::equalize_hist(&gray, &mut equalized)?;
 
         // Dim the live frame as the HUD backdrop.
         frame.convert_to(&mut processed, -1, 0.55, 0.0)?;
 
-        let faces: Vector<Rect> = detect::detect_faces_scaled(&mut cascade, &gray)?;
+        let faces: Vector<Rect> = detect::detect_faces_scaled(&mut cascade, &equalized, &mut small)?;
         let max_w = frame.cols();
         let max_h = frame.rows();
-        let mut seen_track_ids: Vec<u32> = Vec::new();
+        let mut frame_detections = Vec::new();
+        let mut face_rects = Vec::new();
 
         for face in faces.iter() {
             let clamped = match detect::clamp_rect(face, max_w, max_h) {
@@ -143,76 +118,38 @@ pub fn run() -> Result<()> {
                 None => continue,
             };
 
-            let centroid = (
-                (clamped.x + clamped.width / 2) as f32,
-                (clamped.y + clamped.height / 2) as f32,
-            );
-
             // --- ArcFace identity match ---
-            let blob = arcface::preprocess(&frame, clamped)?;
-            let embedding = net.forward(&blob)?;
+            arcface::preprocess(&frame, clamped, &mut resized_face, &mut normalized_face)?;
+            let embedding = net.forward(&normalized_face)?;
             let (best_name, similarity) = arcface::find_best_match(&db, &embedding);
             let is_match = similarity >= arcface::COSINE_THRESHOLD;
             let display_name = if is_match { best_name } else { "UNKNOWN".to_string() };
 
-            // --- Match or create a stable track ---
-            // B5: Distance threshold proportional to face diagonal, not a
-            // fixed pixel count.  This handles varying camera distances and
-            // frame resolutions without hard-coding.
-            let face_diag = ((clamped.width * clamped.width + clamped.height * clamped.height) as f32).sqrt();
-            let max_dist = face_diag * TRACK_DIST_RATIO;
-
-            let track_idx = tracks.iter().position(|t| {
-                let dx = t.centroid.0 - centroid.0;
-                let dy = t.centroid.1 - centroid.1;
-                (dx * dx + dy * dy).sqrt() < max_dist
+            frame_detections.push(Detection {
+                cx: (clamped.x + clamped.width / 2) as f32,
+                cy: (clamped.y + clamped.height / 2) as f32,
+                name: display_name,
+                confidence: similarity,
+                face_diag: ((clamped.width * clamped.width + clamped.height * clamped.height) as f32).sqrt(),
             });
-
-            let track_id = match track_idx {
-                Some(idx) => {
-                    let t = &mut tracks[idx];
-                    t.centroid = centroid;
-                    t.name = display_name.clone();
-                    // EMA smoothing on cosine similarity.
-                    t.confidence = t.confidence * (1.0 - CONFIDENCE_EMA_NEW) + similarity * CONFIDENCE_EMA_NEW;
-                    t.missed = 0;
-                    t.id
-                }
-                None => {
-                    let id = next_track_id;
-                    next_track_id += 1;
-                    tracks.push(Track {
-                        id,
-                        centroid,
-                        name: display_name.clone(),
-                        confidence: similarity,
-                        missed: 0,
-                    });
-                    id
-                }
-            };
-            seen_track_ids.push(track_id);
-
-            // --- Cosmetic structural mesh (Shi-Tomasi nodal features) ---
-            draw_face_mesh(&gray, &mut processed, clamped, max_w, max_h)?;
-
-            // --- HUD: corner brackets + identity info ---
-            draw_face_hud(
-                &mut processed,
-                clamped,
-                is_match,
-                tracks.iter().find(|t| t.id == track_id).unwrap(),
-                &display_name,
-            )?;
+            face_rects.push((clamped, is_match));
         }
 
-        // Drop tracks that have not been associated with a detection recently.
-        for t in tracks.iter_mut() {
-            if !seen_track_ids.contains(&t.id) {
-                t.missed += 1;
+        let updated_tracks = tracker.update(&frame_detections);
+
+        for (i, (clamped, is_match)) in face_rects.iter().enumerate() {
+            if let Some((track_id, ref display_name, confidence)) = updated_tracks.get(i) {
+                // --- HUD: corner brackets + identity info ---
+                draw_face_hud(
+                    &mut processed,
+                    *clamped,
+                    *is_match,
+                    *track_id,
+                    *confidence,
+                    display_name,
+                )?;
             }
         }
-        tracks.retain(|t| t.missed < TRACK_MAX_MISSED);
 
         // --- Global HUD ---
         imgproc::put_text(
@@ -248,70 +185,17 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-// ── Helper: structural mesh ────────────────────────────────────────────
 
-/// Draw a Shi-Tomasi corner-based "wireframe mesh" inside the face bounding
-/// box.  This is purely cosmetic — it gives the HUD a biometric-scan feel.
-fn draw_face_mesh(
-    gray: &Mat,
-    canvas: &mut Mat,
-    face_rect: Rect,
-    max_w: i32,
-    max_h: i32,
-) -> crate::Result<()> {
-    // Shrink the ROI by 10px on each side to avoid edge artifacts.
-    let inner_raw = Rect::new(
-        face_rect.x + 10,
-        face_rect.y + 10,
-        (face_rect.width - 20).max(1),
-        (face_rect.height - 20).max(1),
-    );
-    let inner = detect::clamp_rect(inner_raw, max_w, max_h).unwrap_or(face_rect);
-    let face_roi = Mat::roi(gray, inner)?;
 
-    let mut corners = Vector::<Point2f>::new();
-    features::good_features_to_track(
-        &face_roi,
-        &mut corners,
-        45,
-        0.02,
-        12.0,
-        &Mat::default(),
-        3,
-        false,
-        0.04,
-    )?;
-    let corners_vec: Vec<Point2f> = corners.iter().collect();
-
-    for (i, corner) in corners_vec.iter().enumerate() {
-        let p1 = Point::new(
-            corner.x as i32 + inner.x,
-            corner.y as i32 + inner.y,
-        );
-        imgproc::circle(canvas, p1, 1, NEON_WHITE, -1, imgproc::LINE_AA, 0)?;
-        for other in &corners_vec[i + 1..] {
-            let p2 = Point::new(
-                other.x as i32 + inner.x,
-                other.y as i32 + inner.y,
-            );
-            let dx = p1.x - p2.x;
-            let dy = p1.y - p2.y;
-            if ((dx * dx + dy * dy) as f64).sqrt() < 45.0 {
-                imgproc::line(canvas, p1, p2, MESH_DIM, 1, imgproc::LINE_AA, 0)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-// ── Helper: per-face HUD ───────────────────────────────────────────────
+// ── Helper: per-face HUD
 
 /// Draw corner brackets and identity information next to the face bounding box.
 fn draw_face_hud(
     canvas: &mut Mat,
     rect: Rect,
     is_match: bool,
-    track: &Track,
+    track_id: u32,
+    confidence: f64,
     display_name: &str,
 ) -> crate::Result<()> {
     let accent = if is_match { COLOR_MATCH } else { COLOR_UNKNOWN };
@@ -325,9 +209,9 @@ fn draw_face_hud(
 
     // Identity info panel.
     let lines = [
-        format!("TRACK  : #{:03}", track.id),
+        format!("TRACK  : #{:03}", track_id),
         format!("NAME   : {}", display_name),
-        format!("SIM    : {:.2}", track.confidence),
+        format!("SIM    : {:.2}", confidence),
         format!("STATUS : {}", if is_match { "MATCH" } else { "UNKNOWN" }),
     ];
     for (i, line) in lines.iter().enumerate() {

@@ -14,11 +14,17 @@ use std::path::Path;
 
 use crate::Result;
 
-/// Search paths for the Haar frontal-face cascade, in priority order.
-/// OpenCV 5.x installs to `opencv5/`, while 4.x uses `opencv4/`.
-const CASCADE_PATHS: &[&str] = &[
+/// Path to the Haar frontal-face cascade model.
+///
+/// The local path (from `setup`) is preferred; system paths are fallbacks
+/// for users who already have OpenCV data files installed.
+pub const CASCADE_PATH: &str = "data/models/haarcascade_frontalface_default.xml";
+
+/// Fallback paths searched if the local cascade file is not found.
+const CASCADE_FALLBACKS: &[&str] = &[
     "/usr/share/opencv5/haarcascades/haarcascade_frontalface_default.xml",
     "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
+    "/usr/local/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
 ];
 
 /// Detection runs at this fraction of the input resolution.
@@ -34,27 +40,28 @@ const DETECT_SCALE: f64 = 0.5;
 /// [`DETECT_SCALE`] before being passed to the cascade.
 const CASCADE_MIN_FACE: i32 = 80;
 
-/// Locate the Haar cascade XML file on the filesystem.
+/// Find the first existing cascade file path (local or system fallback).
 ///
-/// Returns the first path from [`CASCADE_PATHS`] that exists, or an error
-/// listing all searched locations.
-pub fn find_cascade() -> Result<&'static str> {
-    for path in CASCADE_PATHS {
-        if Path::new(path).exists() {
-            return Ok(path);
+/// Returns the path as a `String`, or an error if none exist.
+pub fn find_cascade() -> Result<String> {
+    if Path::new(CASCADE_PATH).exists() {
+        return Ok(CASCADE_PATH.to_string());
+    }
+    for fallback in CASCADE_FALLBACKS {
+        if Path::new(fallback).exists() {
+            return Ok(fallback.to_string());
         }
     }
     Err(format!(
-        "Haar cascade not found. Searched:\n{}",
-        CASCADE_PATHS.iter().map(|p| format!("  - {p}")).collect::<Vec<_>>().join("\n")
+        "Haar cascade not found at {CASCADE_PATH} or system paths. Run `cargo run -- setup` to download it."
     ).into())
 }
 
-/// Load and return a [`CascadeClassifier`] from the auto-detected cascade path.
+/// Load and return a [`CascadeClassifier`] from the first available cascade path.
 pub fn load_cascade() -> Result<xobjdetect::CascadeClassifier> {
     let path = find_cascade()?;
     println!("[*] Using cascade: {path}");
-    Ok(xobjdetect::CascadeClassifier::new(path)?)
+    Ok(xobjdetect::CascadeClassifier::new(&path)?)
 }
 
 /// Clamp a rectangle to fit within `[0, max_w) × [0, max_h)`.
@@ -80,11 +87,11 @@ pub fn clamp_rect(r: Rect, max_w: i32, max_h: i32) -> Option<Rect> {
 pub fn detect_faces_scaled(
     cascade: &mut xobjdetect::CascadeClassifier,
     gray: &Mat,
+    small: &mut Mat,
 ) -> Result<Vector<Rect>> {
-    let mut small = Mat::default();
     imgproc::resize(
         gray,
-        &mut small,
+        small,
         Size::new(0, 0),
         DETECT_SCALE,
         DETECT_SCALE,
@@ -94,7 +101,7 @@ pub fn detect_faces_scaled(
     let min_face = (CASCADE_MIN_FACE as f64 * DETECT_SCALE) as i32;
     let mut faces_small: Vector<Rect> = Vector::new();
     cascade.detect_multi_scale(
-        &small,
+        small,
         &mut faces_small,
         1.1,
         5,
